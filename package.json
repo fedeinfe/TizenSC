@@ -1,7 +1,7 @@
 {
-  "name": "@user/tizensc",
+  "name": "@fedeinfe/tizensc",
   "appName": "StreamingCommunity",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "packageType": "mods",
   "websiteURL": "https://streaming-community.you/",
   "main": "dist/userScript.js",

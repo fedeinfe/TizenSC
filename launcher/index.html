@@ -43,6 +43,7 @@
     <div class="buttons">
       <button class="focusable" id="btnOpen">&#9654;&nbsp; Salva e apri</button>
       <button class="focusable" id="btnDefault">&#8634;&nbsp; Usa l'indirizzo predefinito (config.json)</button>
+      <button class="focusable" id="btnAdblock"></button>
       <button class="focusable" id="btnExit">&#10005;&nbsp; Esci</button>
     </div>
     <p class="recent-title hidden" id="recentTitle">Indirizzi recenti</p>
@@ -58,6 +59,7 @@
   var STORAGE_URL = 'tizensc.url';
   var STORAGE_RECENT = 'tizensc.recent';
   var SESSION_LAUNCHED = 'tizensc.launched';
+  var STORAGE_ADBLOCK = 'tizensc.adblock';
   var KEY = { LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40, ENTER: 13, BACK: 10009, ESC: 27, IME_DONE: 65376, IME_CANCEL: 65385 };
 
   var defaultUrl = '';
@@ -101,6 +103,26 @@
     return normalize(load(STORAGE_URL) || defaultUrl);
   }
 
+  function adblockOn() {
+    return load(STORAGE_ADBLOCK) !== '0';
+  }
+
+  function renderAdblock() {
+    $('btnAdblock').innerHTML = adblockOn()
+      ? '&#10003;&nbsp; Blocco pubblicità e pop-up: <b>attivo</b>'
+      : '&#10005;&nbsp; Blocco pubblicità e pop-up: <b>disattivato</b>';
+  }
+
+  // The user script reads this from window.name, which survives navigation:
+  // the site to trust and whether the ad block is on.
+  function passStateToSite(url) {
+    var a = document.createElement('a');
+    a.href = url;
+    try {
+      window.name = 'tizensc:' + JSON.stringify({ hosts: [a.hostname.toLowerCase()], ab: adblockOn() });
+    } catch (e) {}
+  }
+
   function exitApp() {
     try { tizen.application.getCurrentApplication().exit(); } catch (e) { window.close(); }
   }
@@ -115,6 +137,7 @@
     addRecent(url);
     sessionSet(SESSION_LAUNCHED, '1');
     stopCountdown();
+    passStateToSite(url);
     location.href = url;
   }
 
@@ -153,6 +176,7 @@
       : 'Inserisci l\'indirizzo del sito da aprire.';
     $('btnDefault').className = defaultUrl ? 'focusable' : 'hidden';
     renderRecent();
+    renderAdblock();
     focusEl(url ? $('btnOpen') : $('urlInput'));
   }
 
@@ -240,6 +264,10 @@
   $('btnDefault').addEventListener('click', function () {
     store(STORAGE_URL, null);
     go(defaultUrl);
+  });
+  $('btnAdblock').addEventListener('click', function () {
+    store(STORAGE_ADBLOCK, adblockOn() ? '0' : null);
+    renderAdblock();
   });
   $('btnExit').addEventListener('click', exitApp);
 

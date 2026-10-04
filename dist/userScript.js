@@ -8,7 +8,9 @@
  * - Media keys control the <video> (also inside the player iframe)
  * - Red = TizenSC menu, Green = reload, Yellow = back to top
  * - Page zoom for viewing from the sofa, Blue = change zoom level
- * - Blocks pop-ups and opens target="_blank" links in the same window
+ * - Ad block: pop-ups, pop-unders, redirects to ad sites, ad scripts/frames,
+ *   banners and invisible click-catching overlays (can be turned off in the menu)
+ * - Opens target="_blank" links of the site in the same window
  */
 (function () {
   'use strict';
@@ -51,21 +53,480 @@
   })();
 
   var current = null;
+  // Element the user is clicking with OK right now (our own synthetic click).
+  var userClickTarget = null;
 
-  /* ---------- pop-ups ---------- */
+  /* ---------- ad block ---------- */
 
-  window.open = function () { return null; };
+  // Known ad / pop-under networks (matched against the end of the hostname).
+  var AD_DOMAINS = [
+    'doubleclick.net', 'googlesyndication.com', 'googleadservices.com', 'adservice.google.com',
+    'googletagservices.com', 'amazon-adsystem.com', 'adnxs.com', 'criteo.com', 'criteo.net',
+    'taboola.com', 'outbrain.com', 'mgid.com', 'revcontent.com', 'adskeeper.com', 'adskeeper.co.uk',
+    'popads.net', 'popcash.net', 'propellerads.com', 'propellerclick.com', 'onclickads.net',
+    'onclkds.com', 'onclickalgo.com', 'onclickperformance.com', 'adsterra.com', 'adsterratools.com',
+    'highperformanceformat.com', 'highperformancecpm.com', 'profitabledisplaynetwork.com',
+    'effectivegatecpm.com', 'effectiveratecpm.com', 'exoclick.com', 'exosrv.com', 'exdynsrv.com',
+    'realsrv.com', 'juicyads.com', 'hilltopads.net', 'hilltopads.com', 'adcash.com', 'monetag.com',
+    'clickadu.com', 'clickadilla.com', 'trafficjunky.net', 'trafficjunky.com', 'trafficstars.com',
+    'tsyndicate.com', 'a-ads.com', 'ad-maven.com', 'admaven.com', 'galaksion.com', 'zeropark.com',
+    'clickaine.com', 'adspyglass.com', 'popmyads.com', 'poprev.net', 'richpush.co', 'pushame.com',
+    'evadav.com', 'yllix.com', 'bidvertiser.com', 'clicksor.com', 'infolinks.com', 'betteradsystem.com',
+    'dolohen.com', 'pemsrv.com', 'wpadmngr.com', 'inpagepush.com', 'adf.ly', 'shorte.st', 'ouo.io',
+    'linkvertise.com', 'bongacams.com', 'chaturbate.com', 'stripchat.com', 'livejasmin.com'
+  ];
+  var AD_WORDS = /(^|[.\-])(pop(ads|cash|under|up|my)|adsterra|propeller|onclick|clickadu|monetag|exoclick|exosrv|juicyads|hilltop|adcash|adserv|adsystem|adnetwork|syndication|trafficjunky|trafficstars)/;
+  var STATE_NAME_PREFIX = 'tizensc:';
+  var STATE_SESSION_KEY = 'tizensc.state';
+  var LAUNCHER_HOST = '127.0.0.1';
+  var INTENT_MS = 30000;
 
-  document.addEventListener('click', function (e) {
-    var el = e.target;
-    while (el && el !== document) {
-      if (el.tagName === 'A') {
-        if (el.target && el.target !== '_self') el.target = '_self';
-        break;
+  var urlParser = document.createElement('a');
+
+  function hostOf(url) {
+    if (!url) return '';
+    try {
+      urlParser.href = url;
+      return /^https?:$/.test(urlParser.protocol) ? urlParser.hostname.toLowerCase() : '';
+    } catch (e) { return ''; }
+  }
+
+  function baseDomain(h) {
+    h = (h || '').toLowerCase().replace(/^www\./, '');
+    if (/^\d+(\.\d+){3}$/.test(h)) return h;
+    var p = h.split('.');
+    if (p.length <= 2) return h;
+    if (/^(co|com|net|org|gov|edu|ac)$/.test(p[p.length - 2]) && p[p.length - 1].length === 2) {
+      return p.slice(-3).join('.');
+    }
+    return p.slice(-2).join('.');
+  }
+
+  // "streaming-community.ninja" and "streamingcommunity.xyz" are the same site
+  // under a new domain: compare the name without punctuation.
+  function siteName(h) {
+    return baseDomain(h).split('.')[0].replace(/[^a-z0-9]/g, '');
+  }
+
+  function related(h, t) {
+    if (!h || !t) return false;
+    if (h === t || baseDomain(h) === baseDomain(t)) return true;
+    var n = siteName(h);
+    return n.length >= 6 && n === siteName(t);
+  }
+
+  function isAdHost(h) {
+    if (!h) return false;
+    for (var i = 0; i < AD_DOMAINS.length; i++) {
+      var d = AD_DOMAINS[i];
+      if (h === d || h.slice(-d.length - 1) === '.' + d) return true;
+    }
+    return AD_WORDS.test(h);
+  }
+
+  function isAdUrl(url) {
+    return isAdHost(hostOf(url));
+  }
+
+  // State shared between the pages of one session. window.name survives
+  // navigations to other domains, so the guard on an ad page knows which site
+  // we came from; sessionStorage is a fallback on the site's own origin.
+  function readState() {
+    var s = null;
+    try {
+      if (window.name && window.name.indexOf(STATE_NAME_PREFIX) === 0) {
+        s = JSON.parse(window.name.slice(STATE_NAME_PREFIX.length));
       }
+    } catch (e) {}
+    if (!s) {
+      try { s = JSON.parse(sessionStorage.getItem(STATE_SESSION_KEY)); } catch (e) {}
+    }
+    if (!s || typeof s !== 'object') s = {};
+    if (!(s.hosts instanceof Array)) s.hosts = [];
+    return s;
+  }
+
+  function writeState(s, toSession) {
+    var str = JSON.stringify(s);
+    try { window.name = STATE_NAME_PREFIX + str; } catch (e) {}
+    if (toSession) {
+      try { sessionStorage.setItem(STATE_SESSION_KEY, str); } catch (e) {}
+    }
+  }
+
+  var state = isTop ? readState() : { hosts: [] };
+  var adblock = state.ab !== false;
+  var blockedCount = 0;
+
+  function isTrusted(h) {
+    if (!h) return true;
+    if (h === LAUNCHER_HOST) return true;
+    if (!isTop) return related(h, location.hostname);
+    for (var i = 0; i < state.hosts.length; i++) {
+      if (related(h, state.hosts[i])) return true;
+    }
+    return !!(state.allow && related(h, state.allow) && Date.now() - (state.allowT || 0) < INTENT_MS);
+  }
+
+  function trust(h) {
+    if (!h) return;
+    for (var i = 0; i < state.hosts.length; i++) {
+      if (related(h, state.hosts[i])) return;
+    }
+    state.hosts.unshift(h);
+    state.hosts = state.hosts.slice(0, 10);
+  }
+
+  function noteBlocked(what) {
+    blockedCount++;
+    var text = what + (blockedCount > 1 ? ' (' + blockedCount + ' bloccati)' : '');
+    if (document.body) toast(text);
+    else document.addEventListener('DOMContentLoaded', function () { toast(text); });
+  }
+
+  // The user pressed OK on a link to another site: let that navigation through.
+  function noteIntent(el) {
+    var a = closestLink(el);
+    if (!a || !isTop) return;
+    var h = hostOf(a.href);
+    if (!h || isAdHost(h) || isTrusted(h)) return;
+    state.allow = h;
+    state.allowT = Date.now();
+    writeState(state, true);
+  }
+
+  function closestLink(el) {
+    while (el && el.nodeType === 1) {
+      if (el.tagName === 'A' && el.href) return el;
       el = el.parentNode;
     }
+    return null;
+  }
+
+  function opensNewWindow(target) {
+    return !!target && !/^_(self|top|parent)$/i.test(target);
+  }
+
+  function isUserLink(a) {
+    var t = userClickTarget;
+    return !!t && (a === t || a.contains(t) || t.contains(a));
+  }
+
+  // A link that should not be followed: ad network, new window to another
+  // site, or a detached link clicked by a script to another site.
+  function isBadLink(a) {
+    var h = hostOf(a.href);
+    if (!h) return false;
+    if (isAdHost(h)) return true;
+    if (isUserLink(a)) return false;
+    if (isTrusted(h)) return false;
+    return opensNewWindow(a.target) || !document.documentElement.contains(a);
+  }
+
+  // --- 1. landing guard: a top page on a foreign domain we did not ask for ---
+
+  if (isTop) {
+    var here = location.hostname.toLowerCase();
+    var ref = document.referrer || '';
+    var fromLauncher = ref.indexOf(LAUNCHER) === 0 || hostOf(ref) === LAUNCHER_HOST;
+    // No state at all (first page, or the browser cleared window.name): infer the
+    // site from the referrer, or trust this page.
+    if (!state.hosts.length && !fromLauncher && hostOf(ref) && hostOf(ref) !== here) {
+      state.hosts.push(hostOf(ref));
+    }
+    if (fromLauncher || !state.hosts.length || isTrusted(here)) {
+      trust(here);
+      state.allow = null;
+    } else if (adblock) {
+      state.blocked = (state.blocked || 0) + 1;
+      writeState(state, false);
+      try { window.stop(); } catch (e) {}
+      if (history.length > 1) history.back();
+      var fallback = state.last || LAUNCHER + '?menu=1';
+      setTimeout(function () { location.replace(fallback); }, 1500);
+      return;
+    }
+    writeState(state, true);
+
+    window.addEventListener('pagehide', function () {
+      state.last = location.href;
+      writeState(state, true);
+    });
+
+    var showBlocked = function () {
+      var s = readState();
+      if (!s.blocked) return;
+      blockedCount += s.blocked - 1;
+      state.blocked = 0;
+      writeState(state, true);
+      noteBlocked('Pubblicità bloccata');
+    };
+    showBlocked();
+    window.addEventListener('pageshow', function (e) { if (e.persisted) showBlocked(); });
+  }
+
+  // --- 2. pop-ups: window.open never opens anything (no tabs on the TV) ---
+
+  function fakeWindow() {
+    var noop = function () {};
+    var w = {
+      closed: false, opener: null, name: '',
+      location: { href: '', assign: noop, replace: noop, reload: noop },
+      document: { write: noop, writeln: noop, open: noop, close: noop, body: null },
+      focus: noop, blur: noop, postMessage: noop, moveTo: noop, resizeTo: noop,
+      addEventListener: noop, removeEventListener: noop
+    };
+    w.close = function () { w.closed = true; };
+    w.window = w.self = w;
+    return w;
+  }
+
+  function blockedOpen(url) {
+    if (!adblock) return null;
+    noteBlocked('Pop-up bloccato');
+    // Pop-under scripts that see null fall back to redirecting the page: pretend it worked.
+    return fakeWindow();
+  }
+
+  function guardWindow(w) {
+    try {
+      if (!w || w.open === blockedOpen) return;
+      try {
+        Object.defineProperty(w, 'open', { value: blockedOpen, writable: false, configurable: false });
+      } catch (e) {
+        w.open = blockedOpen;
+      }
+    } catch (e) {}
+  }
+
+  guardWindow(window);
+
+  // Pop-up scripts grab a clean window.open from a fresh about:blank iframe.
+  var frameWindowGetter = null;
+  (function () {
+    var proto = window.HTMLIFrameElement && HTMLIFrameElement.prototype;
+    if (!proto) return;
+    ['contentWindow', 'contentDocument'].forEach(function (prop) {
+      var desc = Object.getOwnPropertyDescriptor(proto, prop);
+      if (!desc || !desc.get) return;
+      if (prop === 'contentWindow') frameWindowGetter = desc.get;
+      try {
+        Object.defineProperty(proto, prop, {
+          configurable: true,
+          enumerable: desc.enumerable,
+          get: function () {
+            var v = desc.get.call(this);
+            guardWindow(prop === 'contentWindow' ? v : v && v.defaultView);
+            return v;
+          }
+        });
+      } catch (e) {}
+    });
+  })();
+
+  if (adblock && window.Notification && Notification.requestPermission) {
+    try {
+      Notification.requestPermission = function (cb) {
+        if (typeof cb === 'function') cb('denied');
+        return window.Promise ? Promise.resolve('denied') : undefined;
+      };
+    } catch (e) {}
+  }
+
+  // --- 3. links and clicks ---
+
+  window.addEventListener('click', function (e) {
+    var a = closestLink(e.target);
+    if (!a) return;
+    if (adblock && isBadLink(a)) {
+      e.preventDefault();
+      noteBlocked('Pop-up bloccato');
+      return;
+    }
+    if (opensNewWindow(a.target)) a.target = '_self';
   }, true);
+
+  window.addEventListener('submit', function (e) {
+    var f = e.target;
+    if (adblock && f && opensNewWindow(f.target) && !isTrusted(hostOf(f.action))) {
+      e.preventDefault();
+      noteBlocked('Pop-up bloccato');
+    } else if (f && opensNewWindow(f.target)) {
+      f.target = '_self';
+    }
+  }, true);
+
+  if (adblock) {
+    // Scripts clicking links that are not in the page (or not visible to us).
+    var nativeClick = HTMLElement.prototype.click;
+    HTMLElement.prototype.click = function () {
+      if (this.tagName === 'A' && isBadLink(this)) {
+        noteBlocked('Pop-up bloccato');
+        return;
+      }
+      return nativeClick.apply(this, arguments);
+    };
+    var nativeDispatch = EventTarget.prototype.dispatchEvent;
+    EventTarget.prototype.dispatchEvent = function (ev) {
+      if (ev && ev.type === 'click' && this.tagName === 'A' && isBadLink(this)) {
+        noteBlocked('Pop-up bloccato');
+        return false;
+      }
+      return nativeDispatch.apply(this, arguments);
+    };
+    var nativeSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function () {
+      if (opensNewWindow(this.target) && !isTrusted(hostOf(this.action))) {
+        noteBlocked('Pop-up bloccato');
+        return;
+      }
+      return nativeSubmit.apply(this, arguments);
+    };
+  }
+
+  // --- 4. redirects: cancel navigations to other sites (Chromium 102+) ---
+
+  if (adblock && isTop && window.navigation && navigation.addEventListener) {
+    navigation.addEventListener('navigate', function (e) {
+      var h = hostOf(e.destination && e.destination.url);
+      if (!h || isTrusted(h) || !e.cancelable) return;
+      e.preventDefault();
+      noteBlocked('Pubblicità bloccata');
+    });
+  }
+
+  // --- 5. ad scripts, frames and requests ---
+
+  function isAdElement(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var tag = node.tagName;
+    return (tag === 'SCRIPT' || tag === 'IFRAME' || tag === 'IMG' || tag === 'EMBED' || tag === 'OBJECT') &&
+      isAdUrl(node.src || node.data || '');
+  }
+
+  function guardFrames(node) {
+    if (!frameWindowGetter || !node || node.nodeType !== 1) return;
+    var frames = node.tagName === 'IFRAME' ? [node] : node.getElementsByTagName ? node.getElementsByTagName('iframe') : [];
+    for (var i = 0; i < frames.length; i++) {
+      try { guardWindow(frameWindowGetter.call(frames[i])); } catch (e) {}
+    }
+  }
+
+  if (adblock) {
+    var wrapInsert = function (proto, name, nodeArg) {
+      var native = proto && proto[name];
+      if (!native) return;
+      proto[name] = function () {
+        var node = arguments[nodeArg];
+        if (isAdElement(node)) return node;
+        var result = native.apply(this, arguments);
+        guardFrames(node);
+        return result;
+      };
+    };
+    wrapInsert(Node.prototype, 'appendChild', 0);
+    wrapInsert(Node.prototype, 'insertBefore', 0);
+    wrapInsert(Node.prototype, 'replaceChild', 0);
+
+    var nativeFetch = window.fetch;
+    if (nativeFetch) {
+      window.fetch = function (input) {
+        var url = input && typeof input === 'object' ? input.url : input;
+        if (isAdUrl(url)) return Promise.reject(new TypeError('Failed to fetch'));
+        return nativeFetch.apply(this, arguments);
+      };
+    }
+    var nativeXhrOpen = XMLHttpRequest.prototype.open;
+    var nativeXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__tscBlocked = isAdUrl(url);
+      return nativeXhrOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      if (this.__tscBlocked) return;
+      return nativeXhrSend.apply(this, arguments);
+    };
+  }
+
+  // --- 6. banners and invisible overlays that catch clicks ---
+
+  var AD_CSS =
+    'ins.adsbygoogle,[id^="div-gpt-ad"],[id^="google_ads_"],[id*="popunder"],[class*="popunder"],' +
+    '[data-tsc-ad]{display:none !important;}';
+
+  function isTransparent(cs) {
+    var bg = cs.backgroundColor;
+    return (!bg || bg === 'transparent' || /rgba\(.*,\s*0\)$/.test(bg)) && cs.backgroundImage === 'none';
+  }
+
+  // Full-screen layers added on top of the page by ad scripts: invisible
+  // click-catchers, or layers whose only content is a link to another site.
+  function isOverlay(el) {
+    if (!el || el.nodeType !== 1 || /^tsc-/.test(el.id || '')) return false;
+    if (/^(SCRIPT|STYLE|LINK|META|VIDEO|HEAD|BODY)$/.test(el.tagName)) return false;
+    var cs = window.getComputedStyle(el);
+    if (cs.display === 'none' || (cs.position !== 'fixed' && cs.position !== 'absolute')) return false;
+    if (!(parseInt(cs.zIndex, 10) >= 1000)) return false;
+    var r = el.getBoundingClientRect();
+    var vp = viewport();
+    if (r.width * r.height < vp.w * vp.h * 0.5) return false;
+    if (el.querySelector('video')) return false;
+    var frames = el.tagName === 'IFRAME' ? [el] : el.getElementsByTagName('iframe');
+    for (var i = 0; i < frames.length; i++) {
+      if (!isAdUrl(frames[i].src)) return false;
+    }
+    var text = (el.innerText || '').replace(/\s+/g, '');
+    if (!text && (parseFloat(cs.opacity) < 0.2 || isTransparent(cs))) return true;
+    var link = el.tagName === 'A' ? el : null;
+    if (!link) {
+      var links = el.getElementsByTagName('a');
+      if (links.length === 1 && text.length < 3) link = links[0];
+    }
+    return !!link && !isTrusted(hostOf(link.href));
+  }
+
+  function hideAd(el) {
+    el.setAttribute('data-tsc-ad', '');
+    el.style.setProperty('display', 'none', 'important');
+    if (current && el.contains(current)) setCurrent(null);
+  }
+
+  function sweep() {
+    var roots = [document.documentElement, document.body];
+    for (var i = 0; i < roots.length; i++) {
+      var kids = roots[i] ? roots[i].children : [];
+      for (var j = 0; j < kids.length; j++) {
+        if (!kids[j].hasAttribute('data-tsc-ad') && isOverlay(kids[j])) hideAd(kids[j]);
+      }
+    }
+    var ads = document.querySelectorAll('iframe,embed,object');
+    for (var k = 0; k < ads.length; k++) {
+      if (!ads[k].hasAttribute('data-tsc-ad') && isAdElement(ads[k])) hideAd(ads[k]);
+    }
+  }
+
+  var sweepTimer = null;
+  function scheduleSweep() {
+    if (sweepTimer) return;
+    sweepTimer = setTimeout(function () {
+      sweepTimer = null;
+      if (document.body) sweep();
+    }, 300);
+  }
+
+  if (adblock) {
+    try {
+      new MutationObserver(function (records) {
+        for (var i = 0; i < records.length; i++) {
+          var added = records[i].addedNodes;
+          for (var j = 0; j < added.length; j++) guardFrames(added[j]);
+        }
+        scheduleSweep();
+      }).observe(document, { childList: true, subtree: true });
+    } catch (e) {}
+    document.addEventListener('DOMContentLoaded', scheduleSweep);
+    window.addEventListener('load', scheduleSweep);
+  }
 
   /* ---------- style ---------- */
 
@@ -77,7 +538,7 @@
     style.id = 'tsc-style';
     style.textContent =
       '.' + FOCUS_CLASS + '{outline:4px solid #e50914 !important;outline-offset:2px !important;' +
-      'box-shadow:0 0 0 7px rgba(229,9,20,.45) !important;}';
+      'box-shadow:0 0 0 7px rgba(229,9,20,.45) !important;}' + (adblock ? AD_CSS : '');
     parent.appendChild(style);
   }
 
@@ -273,6 +734,7 @@
       // Only look around the visible area to keep it fast on the TV.
       if (r.bottom < -vp.h * 1.5 || r.top > vp.h * 2.5) continue;
       if (!isVisible(el)) continue;
+      if (adblock && el.tagName === 'A' && isBadLink(el)) continue;
       out.push(el);
     }
     return out;
@@ -475,7 +937,9 @@
         } else if (target.tagName === 'VIDEO') {
           if (target.paused) target.play(); else target.pause();
         } else {
-          target.click();
+          noteIntent(target);
+          userClickTarget = target;
+          try { target.click(); } finally { userClickTarget = null; }
         }
         return;
       }

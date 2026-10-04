@@ -31,7 +31,24 @@ L'indirizzo viene ricordato: dagli avvii successivi il sito si apre da solo dopo
 
 Le pagine del sito sono ingrandite (zoom 150%) per essere leggibili dal divano; a schermo intero lo zoom si disattiva.
 
-Pop-up e link "nuova finestra" vengono aperti nella stessa finestra (o bloccati), perché sulla TV non esistono schede.
+## Blocco pubblicità e pop-up
+
+Attivo di default. Blocca:
+
+- **pop-up e pop-under**: le finestre che il sito prova ad aprire a ogni clic vengono bloccate (anche i trucchi
+  per aggirare il blocco, come i link creati e cliccati di nascosto o gli iframe vuoti);
+- **redirect pubblicitari**: se un clic prova a portarti su un altro sito, la navigazione viene annullata;
+  sulle TV più vecchie la pagina pubblicitaria viene chiusa subito e si torna al sito;
+- **script, banner e iframe** dei principali circuiti pubblicitari;
+- **livelli invisibili** stesi sopra la pagina (o sopra il player) che catturano i clic.
+
+Quando qualcosa viene bloccato compare un avviso in alto a destra ("Pop-up bloccato", "Pubblicità bloccata").
+I link verso altri siti che scegli tu con **OK** vengono aperti normalmente.
+
+Se il sito smette di funzionare bene, il blocco si può disattivare dal menu (tasto **Rosso**) →
+**Blocco pubblicità e pop-up**, poi **Salva e apri**.
+
+I link "nuova finestra" del sito vengono aperti nella stessa finestra, perché sulla TV non esistono schede.
 
 ## Cambiare l'indirizzo predefinito
 
@@ -46,7 +63,7 @@ Se il sito cambia dominio puoi:
 
 - `package.json` – descrizione del modulo per TizenBrew (`packageType: "mods"`)
 - `launcher/index.html` – schermata iniziale (avvio automatico / impostazioni)
-- `dist/userScript.js` – script iniettato in ogni pagina: navigazione col telecomando, tasti media, blocco pop-up
+- `dist/userScript.js` – script iniettato in ogni pagina: navigazione col telecomando, tasti media, blocco pubblicità e pop-up
 - `config.json` – indirizzo predefinito
 
 Dopo aver modificato i file su GitHub, svuota la cache di jsDelivr per vederli subito sulla TV:

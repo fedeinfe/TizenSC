@@ -19,7 +19,7 @@ L'indirizzo viene ricordato: dagli avvii successivi il sito si apre da solo dopo
 
 | Tasto | Azione |
 |---|---|
-| Frecce | Spostano la selezione (riquadro rosso) tra link e pulsanti; scorrono la pagina se non c'è altro |
+| Frecce | Spostano la selezione (riquadro rosso) tra link, pulsanti, copertine e tutto ciò che è cliccabile; scorrono la pagina se non c'è altro |
 | OK | Apre/clicca l'elemento selezionato; sul player entra nel video |
 | Indietro | Pagina precedente · esce dallo schermo intero · esce dal player · dalla prima pagina torna al menu |
 | Play/Pausa, Stop, Avanti/Indietro veloce | Controllano il video (±10 s) |
@@ -28,6 +28,10 @@ L'indirizzo viene ricordato: dagli avvii successivi il sito si apre da solo dopo
 | Verde | Ricarica la pagina |
 | Giallo | Torna in cima alla pagina |
 | Blu | Cambia lo zoom: 100% → 125% → 150% → 175% → 200% (predefinito 150%, viene ricordato) |
+
+La selezione salta solo su elementi davvero visibili: le righe di copertine scorrono da sole seguendo il
+riquadro, le slide nascoste negli slider si raggiungono con le loro frecce e, quando è aperta una finestra
+di dialogo, la selezione resta al suo interno. ←/→ si muovono sempre sulla stessa riga.
 
 Le pagine del sito sono ingrandite (zoom 150%) per essere leggibili dal divano; a schermo intero lo zoom si disattiva.
 

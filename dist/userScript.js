@@ -3,7 +3,8 @@
  * opened by the module. Written in plain ES5 so it runs on old Tizen
  * (Chromium 47+) without a build step.
  *
- * - Spatial navigation with the remote's arrow keys, OK = click
+ * - Spatial navigation with the remote's arrow keys: a highlight ring moves
+ *   between links, buttons and anything clickable; OK = click
  * - Back = previous page / exit fullscreen / leave the player frame
  * - Media keys control the <video> (also inside the player iframe)
  * - Red = TizenSC menu, Green = reload, Yellow = back to top
@@ -42,9 +43,14 @@
   var SELECTOR = [
     'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
     '[tabindex]:not([tabindex="-1"])', '[role="button"]', '[role="link"]',
-    '[role="menuitem"]', '[role="tab"]', '[role="option"]', '[onclick]',
-    'summary', 'video', 'iframe'
+    '[role="menuitem"]', '[role="tab"]', '[role="option"]', '[role="checkbox"]',
+    '[role="radio"]', '[role="switch"]', '[role="treeitem"]', '[onclick]',
+    '[contenteditable="true"]', 'summary', 'label[for]', 'video', 'iframe'
   ].join(',');
+  // Elements that only look clickable (cursor:pointer, click handler added by
+  // JS) are found by scanning the page; cap the scan on huge pages.
+  var MAX_SCAN = 8000;
+  var POINTER_CACHE_MS = 1000;
 
   var isTop = (function () {
     try { return window.top === window; } catch (e) { return false; }
@@ -75,9 +81,19 @@
     if (!parent) return;
     var style = document.createElement('style');
     style.id = 'tsc-style';
+    // The highlight is a separate ring drawn above the page, so carousels and
+    // cards with overflow:hidden cannot clip it. The site's own focus outline
+    // is hidden to avoid a double frame.
     style.textContent =
-      '.' + FOCUS_CLASS + '{outline:4px solid #e50914 !important;outline-offset:2px !important;' +
-      'box-shadow:0 0 0 7px rgba(229,9,20,.45) !important;}';
+      '.' + FOCUS_CLASS + '{outline:none !important;}' +
+      '#tsc-ring{position:fixed !important;display:none;z-index:2147483646 !important;' +
+      'pointer-events:none !important;box-sizing:border-box !important;margin:0 !important;' +
+      'padding:0 !important;border:4px solid #e50914 !important;border-radius:8px !important;' +
+      'background:transparent !important;transform:none !important;' +
+      'box-shadow:0 0 0 2px rgba(0,0,0,.7),0 0 18px 4px rgba(229,9,20,.75),inset 0 0 0 2px rgba(0,0,0,.5) !important;}' +
+      '#tsc-ring-probe{position:fixed !important;left:0 !important;top:0 !important;width:100px !important;' +
+      'height:100px !important;visibility:hidden !important;pointer-events:none !important;' +
+      'margin:0 !important;padding:0 !important;border:0 !important;transform:none !important;}';
     parent.appendChild(style);
   }
 
@@ -108,7 +124,13 @@
     try { localStorage.setItem(ZOOM_STORAGE, String(z)); } catch (e) {}
     applyZoom(z);
     toast('Zoom ' + Math.round(z * 100) + '%');
-    if (current) setTimeout(function () { if (current) ensureVisible(current); }, 50);
+    if (current) {
+      setTimeout(function () {
+        if (!current) return;
+        ensureVisible(current);
+        followRing();
+      }, 50);
+    }
   }
 
   var toastTimer = null;
@@ -226,12 +248,108 @@
     try { win.postMessage({ tizensc: data }, '*'); } catch (e) {}
   }
 
+  /* ---------- highlight ring ---------- */
+
+  var ring = null;
+  var probe = null;
+  var ringBox = '';
+  var followUntil = 0;
+  var followQueued = false;
+
+  // The ring goes inside the fullscreen element when there is one (anything
+  // else is hidden by the browser), otherwise at the end of <body>.
+  function ringParent() {
+    var fs = fullscreenElement();
+    if (fs) return /^(VIDEO|IFRAME)$/.test(fs.tagName) ? null : fs;
+    return document.body || document.documentElement;
+  }
+
+  function hideRing() {
+    if (ring) ring.style.display = 'none';
+    ringBox = '';
+  }
+
+  function updateRing(animate) {
+    var el = current;
+    var parent = ringParent();
+    if (!el || !parent || !el.classList || !el.classList.contains(FOCUS_CLASS) ||
+        !document.documentElement.contains(el) || (parent !== document.body && !parent.contains(el)) ||
+        !isVisible(el)) {
+      hideRing();
+      return;
+    }
+    injectStyle();
+    if (!ring) {
+      ring = document.createElement('div');
+      ring.id = 'tsc-ring';
+      probe = document.createElement('div');
+      probe.id = 'tsc-ring-probe';
+    }
+    if (ring.parentNode !== parent) {
+      parent.appendChild(probe);
+      parent.appendChild(ring);
+    }
+    // Measure how the page zoom maps CSS pixels to getBoundingClientRect()
+    // units (it differs between Chromium versions) with a 100px probe, so the
+    // ring lands exactly on the element at any zoom level.
+    var p = probe.getBoundingClientRect();
+    var k = p.width / 100 || 1;
+    var r = el.getBoundingClientRect();
+    var vp = viewport();
+    var gap = 3 * k;
+    var left = Math.max(r.left - gap, 0);
+    var top = Math.max(r.top - gap, 0);
+    var right = Math.min(r.right + gap, vp.w);
+    var bottom = Math.min(r.bottom + gap, vp.h);
+    if (right - left < 4 || bottom - top < 4) {
+      hideRing();
+      return;
+    }
+    var box = [
+      Math.round((left - p.left) / k), Math.round((top - p.top) / k),
+      Math.round((right - left) / k), Math.round((bottom - top) / k)
+    ];
+    var key = box.join(',');
+    if (key === ringBox && ring.style.display === 'block') return;
+    ring.style.transition = animate && ringBox ?
+      'left .12s ease-out,top .12s ease-out,width .12s ease-out,height .12s ease-out' : 'none';
+    ringBox = key;
+    ring.style.left = box[0] + 'px';
+    ring.style.top = box[1] + 'px';
+    ring.style.width = box[2] + 'px';
+    ring.style.height = box[3] + 'px';
+    ring.style.display = 'block';
+  }
+
+  // Keep the ring on its element for a moment after a move: smooth scrolling,
+  // carousel animations and lazy-loaded images shift things around.
+  function followRing(ms) {
+    followUntil = Math.max(followUntil, Date.now() + (ms || 800));
+    if (followQueued) return;
+    followQueued = true;
+    requestAnimationFrame(function step() {
+      updateRing(false);
+      if (Date.now() < followUntil) {
+        requestAnimationFrame(step);
+      } else {
+        followQueued = false;
+      }
+    });
+  }
+
+  window.addEventListener('scroll', function () { if (current) followRing(150); }, true);
+  window.addEventListener('resize', function () { if (current) followRing(300); });
+  setInterval(function () { if (current) updateRing(false); }, 500);
+
   /* ---------- focus ---------- */
 
   function setCurrent(el, domFocus) {
     if (current && current.classList) current.classList.remove(FOCUS_CLASS);
     current = el;
-    if (!el) return;
+    if (!el) {
+      hideRing();
+      return;
+    }
     injectStyle();
     el.classList.add(FOCUS_CLASS);
     if (domFocus !== false) {
@@ -240,40 +358,194 @@
       }
       // The iframe itself is only highlighted; OK enters it.
       if (el.tagName !== 'IFRAME') {
-        try { el.focus(); } catch (e) {}
+        // We scroll ourselves (ensureVisible): a plain focus() would also
+        // scroll overflow:hidden sliders and break their layout.
+        try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
       } else if (document.activeElement && document.activeElement.blur) {
         document.activeElement.blur();
       }
     }
     ensureVisible(el);
+    updateRing(true);
+    followRing();
+  }
+
+  function clearHighlight() {
+    if (current && current.classList) current.classList.remove(FOCUS_CLASS);
+    hideRing();
+  }
+
+  function isScroller(overflow) {
+    return overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay';
+  }
+
+  // Bring the element into view inside scrollable containers (horizontal
+  // rows of covers, side lists...), then in the page.
+  function scrollContainers(el) {
+    for (var a = el.parentElement; a && a !== document.body && a !== document.documentElement; a = a.parentElement) {
+      var cs = window.getComputedStyle(a);
+      var sx = isScroller(cs.overflowX) && a.scrollWidth > a.clientWidth;
+      var sy = isScroller(cs.overflowY) && a.scrollHeight > a.clientHeight;
+      if (!sx && !sy) continue;
+      var r = el.getBoundingClientRect();
+      var ar = a.getBoundingClientRect();
+      // rect units per CSS pixel of this container (depends on the zoom)
+      var k = a.offsetWidth ? ar.width / a.offsetWidth : 1;
+      if (!k) k = 1;
+      var pad = Math.min(40 * k, ar.width / 10);
+      if (sx && (r.left < ar.left + pad || r.right > ar.right - pad)) {
+        a.scrollLeft += (r.left + r.width / 2 - (ar.left + ar.width / 2)) / k;
+      }
+      pad = Math.min(40 * k, ar.height / 10);
+      if (sy && (r.top < ar.top + pad || r.bottom > ar.bottom - pad)) {
+        a.scrollTop += (r.top + r.height / 2 - (ar.top + ar.height / 2)) / k;
+      }
+    }
   }
 
   function ensureVisible(el) {
+    scrollContainers(el);
     var r = el.getBoundingClientRect();
     var vp = viewport();
-    var margin = vp.h * 0.12;
-    var outside = r.top < margin || r.bottom > vp.h - margin || r.left < 0 || r.right > vp.w;
-    if (!outside) return;
+    var margin = Math.min(vp.h * 0.12, Math.max(0, (vp.h - r.height) / 2));
+    if (r.top >= margin && r.bottom <= vp.h - margin) return;
+    // scrollIntoView also scrolls overflow:hidden boxes (sliders that move
+    // with transforms), which shifts them out of place: put those back.
+    var clipped = [];
+    for (var a = el.parentElement; a && a !== document.body && a !== document.documentElement; a = a.parentElement) {
+      if (a.scrollLeft || a.scrollTop || a.scrollWidth > a.clientWidth || a.scrollHeight > a.clientHeight) {
+        var cs = window.getComputedStyle(a);
+        if (!isScroller(cs.overflowX) || !isScroller(cs.overflowY)) clipped.push([a, a.scrollLeft, a.scrollTop]);
+      }
+    }
     // Let the browser do the maths: it knows how the zoom affects scrolling.
+    var done = false;
     if (el.scrollIntoViewIfNeeded) {
       el.scrollIntoViewIfNeeded(true);
       r = el.getBoundingClientRect();
-      if (r.top >= margin && r.bottom <= vp.h - margin) return;
+      done = r.top >= margin && r.bottom <= vp.h - margin;
     }
-    try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { el.scrollIntoView(false); }
+    if (!done) {
+      try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { el.scrollIntoView(false); }
+    }
+    for (var i = 0; i < clipped.length; i++) {
+      var c = clipped[i];
+      var ccs = window.getComputedStyle(c[0]);
+      if (!isScroller(ccs.overflowX)) c[0].scrollLeft = c[1];
+      if (!isScroller(ccs.overflowY)) c[0].scrollTop = c[2];
+    }
+  }
+
+  /* ---------- what can be selected ---------- */
+
+  var scanGen = 0;
+  var pointerCache = { time: 0, list: [] };
+
+  function ownElement(el) {
+    return el === ring || el === probe || el.id === 'tsc-toast';
+  }
+
+  function cursorOf(el) {
+    if (el.__tscCursorGen !== scanGen) {
+      el.__tscCursorGen = scanGen;
+      el.__tscCursor = window.getComputedStyle(el).cursor;
+    }
+    return el.__tscCursor;
+  }
+
+  // Divs, cards and icons that the site made clickable with JavaScript: they
+  // show a hand cursor. Only the outermost element of each is kept (the
+  // cursor is inherited), and not when it already holds a real link/button.
+  function pointerElements() {
+    var now = Date.now();
+    if (now - pointerCache.time < POINTER_CACHE_MS) return pointerCache.list;
+    var out = [];
+    var body = document.body;
+    if (body) {
+      var all = body.getElementsByTagName('*');
+      var n = Math.min(all.length, MAX_SCAN);
+      for (var i = 0; i < n; i++) {
+        var el = all[i];
+        if (cursorOf(el) !== 'pointer' || ownElement(el)) continue;
+        var parent = el.parentElement;
+        if (parent && parent !== body && cursorOf(parent) === 'pointer') continue;
+        if (el.matches && el.matches(SELECTOR)) continue;
+        if (el.closest && el.closest(SELECTOR)) continue;
+        if (el.querySelector(SELECTOR)) continue;
+        out.push(el);
+      }
+    }
+    pointerCache = { time: now, list: out };
+    return out;
+  }
+
+  function overflowOf(a) {
+    if (a.__tscOverflowGen !== scanGen) {
+      var cs = window.getComputedStyle(a);
+      a.__tscOverflowGen = scanGen;
+      a.__tscOverflowX = cs.overflowX;
+      a.__tscOverflowY = cs.overflowY;
+    }
+  }
+
+  // False for elements the user could never see: slides parked outside a
+  // slider, items of a collapsed menu, drawers moved off-screen.
+  function isReachable(el, r, vp) {
+    var cx = r.left + r.width / 2;
+    var cy = r.top + r.height / 2;
+    var scrollX = false;
+    var scrollY = false;
+    for (var a = el.parentElement; a && a !== document.body && a !== document.documentElement; a = a.parentElement) {
+      overflowOf(a);
+      var ox = a.__tscOverflowX;
+      var oy = a.__tscOverflowY;
+      if (ox === 'visible' && oy === 'visible') continue;
+      var ar = null;
+      if (isScroller(ox)) scrollX = true;
+      else if (ox !== 'visible' && !scrollX) {
+        ar = a.getBoundingClientRect();
+        if (cx < ar.left || cx > ar.right) return false;
+      }
+      if (isScroller(oy)) scrollY = true;
+      else if (oy !== 'visible' && !scrollY) {
+        ar = ar || a.getBoundingClientRect();
+        if (cy < ar.top || cy > ar.bottom) return false;
+      }
+    }
+    if (!scrollX && (r.right <= 0 || r.left >= vp.w)) return false;
+    return true;
+  }
+
+  // An open modal dialog keeps the selection inside it.
+  function modalRoot() {
+    var list = document.querySelectorAll('dialog[open],[aria-modal="true"]');
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (isVisible(list[i])) return list[i];
+    }
+    return null;
   }
 
   function candidates() {
-    var all = document.querySelectorAll(SELECTOR);
+    scanGen++;
+    var root = modalRoot();
+    var all = (root || document).querySelectorAll(SELECTOR);
+    var extra = pointerElements();
     var vp = viewport();
+    var maxArea = vp.w * vp.h * 0.6;
     var out = [];
-    for (var i = 0; i < all.length; i++) {
-      var el = all[i];
-      var r = el.getBoundingClientRect();
-      // Only look around the visible area to keep it fast on the TV.
-      if (r.bottom < -vp.h * 1.5 || r.top > vp.h * 2.5) continue;
-      if (!isVisible(el)) continue;
-      out.push(el);
+    var lists = [all, extra];
+    for (var l = 0; l < lists.length; l++) {
+      var list = lists[l];
+      for (var i = 0; i < list.length; i++) {
+        var el = list[i];
+        if (root && !root.contains(el)) continue;
+        var r = el.getBoundingClientRect();
+        // Only look around the visible area to keep it fast on the TV.
+        if (r.bottom < -vp.h * 1.5 || r.top > vp.h * 2.5) continue;
+        if (l === 1 && r.width * r.height > maxArea) continue;
+        if (!isVisible(el) || !isReachable(el, r, vp)) continue;
+        out.push(el);
+      }
     }
     return out;
   }
@@ -285,7 +557,7 @@
     var bestScore = Infinity;
     for (var i = 0; i < list.length; i++) {
       var r = list[i].getBoundingClientRect();
-      if (r.bottom < 0 || r.top > vp.h) continue;
+      if (r.bottom < 0 || r.top > vp.h || r.right < 0 || r.left > vp.w) continue;
       var score = Math.max(0, r.top) * 3 + Math.max(0, r.left);
       if (score < bestScore) {
         bestScore = score;
@@ -312,14 +584,17 @@
       var primary, ortho, orthoCenter;
 
       if (dir === 'right' || dir === 'left') {
-        if (dir === 'right' && !(cx > ccx + 1 && r.right > cr.right)) continue;
-        if (dir === 'left' && !(cx < ccx - 1 && r.left < cr.left)) continue;
+        if (dir === 'right' && !(cx > ccx + 1)) continue;
+        if (dir === 'left' && !(cx < ccx - 1)) continue;
         primary = dir === 'right' ? r.left - cr.right : cr.left - r.right;
         ortho = Math.max(0, Math.max(r.top, cr.top) - Math.min(r.bottom, cr.bottom));
         orthoCenter = Math.abs(cy - ccy);
+        // Left/right stay on the same row: at the end of a row nothing
+        // happens instead of jumping to some far away element.
+        if (ortho > 0 && orthoCenter > Math.max(cr.height, r.height)) continue;
       } else {
-        if (dir === 'down' && !(cy > ccy + 1 && r.bottom > cr.bottom)) continue;
-        if (dir === 'up' && !(cy < ccy - 1 && r.top < cr.top)) continue;
+        if (dir === 'down' && !(cy > ccy + 1)) continue;
+        if (dir === 'up' && !(cy < ccy - 1)) continue;
         primary = dir === 'down' ? r.top - cr.bottom : cr.top - r.bottom;
         ortho = Math.max(0, Math.max(r.left, cr.left) - Math.min(r.right, cr.right));
         orthoCenter = Math.abs(cx - ccx);
@@ -364,7 +639,7 @@
   }
 
   function leaveFrame(dir) {
-    if (current && current.classList) current.classList.remove(FOCUS_CLASS);
+    clearHighlight();
     post(window.parent, { type: 'leave-frame', dir: dir });
   }
 
@@ -372,6 +647,22 @@
     var vp = viewport();
     if (dir === 'down') window.scrollBy(0, vp.h * 0.5);
     else if (dir === 'up') window.scrollBy(0, -vp.h * 0.5);
+  }
+
+  // click() does not exist on SVG icons: dispatch the event by hand there.
+  function activate(el) {
+    if (typeof el.click === 'function') {
+      el.click();
+      return;
+    }
+    var ev;
+    try {
+      ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+    } catch (e) {
+      ev = document.createEvent('MouseEvents');
+      ev.initMouseEvent('click', true, true, window, 1, 0, 0, 0, 0, false, false, false, false, 0, null);
+    }
+    el.dispatchEvent(ev);
   }
 
   function frameElementFor(win) {
@@ -469,13 +760,13 @@
         e.preventDefault();
         e.stopPropagation();
         if (target.tagName === 'IFRAME') {
-          target.classList.remove(FOCUS_CLASS);
+          clearHighlight();
           try { target.focus(); target.contentWindow.focus(); } catch (err) {}
           post(target.contentWindow, { type: 'enter-frame' });
         } else if (target.tagName === 'VIDEO') {
           if (target.paused) target.play(); else target.pause();
         } else {
-          target.click();
+          activate(target);
         }
         return;
       }
@@ -566,6 +857,7 @@
       current = el;
       injectStyle();
       el.classList.add(FOCUS_CLASS);
+      updateRing(true);
     }
   }, true);
 

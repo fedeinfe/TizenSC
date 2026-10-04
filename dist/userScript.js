@@ -7,6 +7,7 @@
  * - Back = previous page / exit fullscreen / leave the player frame
  * - Media keys control the <video> (also inside the player iframe)
  * - Red = TizenSC menu, Green = reload, Yellow = back to top
+ * - Page zoom for viewing from the sofa, Blue = change zoom level
  * - Blocks pop-ups and opens target="_blank" links in the same window
  */
 (function () {
@@ -25,7 +26,7 @@
     LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40, ENTER: 13,
     BACK: 10009, ESC: 27,
     PLAY_PAUSE: 10252, PLAY: 415, PAUSE: 19, STOP: 413, FF: 417, RW: 412,
-    RED: 403, GREEN: 404, YELLOW: 405
+    RED: 403, GREEN: 404, YELLOW: 405, BLUE: 406
   };
   var DIRS = {};
   DIRS[KEY.LEFT] = 'left';
@@ -34,6 +35,9 @@
   DIRS[KEY.DOWN] = 'down';
 
   var SEEK_SECONDS = 10;
+  var ZOOM_LEVELS = [1, 1.25, 1.5, 1.75, 2];
+  var DEFAULT_ZOOM = 1.5;
+  var ZOOM_STORAGE = 'tizensc.zoom';
   var FOCUS_CLASS = 'tsc-focus';
   var SELECTOR = [
     'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
@@ -77,13 +81,94 @@
     parent.appendChild(style);
   }
 
+  /* ---------- zoom ---------- */
+
+  function getZoom() {
+    var z = null;
+    try { z = parseFloat(localStorage.getItem(ZOOM_STORAGE)); } catch (e) {}
+    return ZOOM_LEVELS.indexOf(z) === -1 ? DEFAULT_ZOOM : z;
+  }
+
+  function applyZoom(z) {
+    var root = document.documentElement;
+    if (!root) return;
+    var style = document.getElementById('tsc-zoom');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'tsc-zoom';
+      (document.head || root).appendChild(style);
+    }
+    // No zoom while something is fullscreen, so the player fills the screen exactly.
+    style.textContent = z === 1 ? '' : 'html:not([data-tsc-fs]){zoom:' + z + ' !important;}';
+  }
+
+  function cycleZoom() {
+    var idx = ZOOM_LEVELS.indexOf(getZoom());
+    var z = ZOOM_LEVELS[(idx + 1) % ZOOM_LEVELS.length];
+    try { localStorage.setItem(ZOOM_STORAGE, String(z)); } catch (e) {}
+    applyZoom(z);
+    toast('Zoom ' + Math.round(z * 100) + '%');
+    if (current) setTimeout(function () { if (current) ensureVisible(current); }, 50);
+  }
+
+  var toastTimer = null;
+  function toast(text) {
+    var el = document.getElementById('tsc-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'tsc-toast';
+      el.style.cssText = 'position:fixed;top:40px;right:40px;z-index:2147483647;padding:14px 26px;' +
+        'background:rgba(0,0,0,.85);color:#fff;font:bold 28px Arial,sans-serif;border-radius:10px;' +
+        'border:3px solid #e50914;pointer-events:none;';
+      (document.body || document.documentElement).appendChild(el);
+    }
+    el.textContent = text;
+    el.style.display = 'block';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.style.display = 'none'; }, 1500);
+  }
+
+  function onFullscreenChange() {
+    if (fullscreenElement()) document.documentElement.setAttribute('data-tsc-fs', '');
+    else document.documentElement.removeAttribute('data-tsc-fs');
+  }
+
+  // The script can run before <html>/<head> exist: (re)apply the zoom as soon
+  // as they appear, and keep our <style> in place if the page replaces <head>.
+  function ensureZoom() {
+    var style = document.getElementById('tsc-zoom');
+    if (style && document.head && style.parentNode !== document.head) {
+      document.head.appendChild(style);
+    }
+    if (!style || !document.documentElement.contains(style)) applyZoom(getZoom());
+  }
+
+  if (isTop) {
+    if (document.documentElement) applyZoom(getZoom());
+    try {
+      var zoomObserver = new MutationObserver(function () {
+        if (!document.documentElement) return;
+        ensureZoom();
+        if (document.body) zoomObserver.disconnect();
+      });
+      zoomObserver.observe(document, { childList: true, subtree: true });
+    } catch (e) {}
+    document.addEventListener('DOMContentLoaded', ensureZoom);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+  }
+
   /* ---------- helpers ---------- */
 
+  // Visible area in the same units getBoundingClientRect() uses. With CSS zoom
+  // on <html> older Chromium reports rects in unzoomed pixels, newer in zoomed ones.
   function viewport() {
-    return {
-      w: window.innerWidth || document.documentElement.clientWidth,
-      h: window.innerHeight || document.documentElement.clientHeight
-    };
+    var w = window.innerWidth || document.documentElement.clientWidth;
+    var h = window.innerHeight || document.documentElement.clientHeight;
+    var rw = document.documentElement.getBoundingClientRect().width;
+    var k = rw && w ? rw / w : 1;
+    if (k < 0.3 || k > 1.05) k = 1;
+    return { w: w * k, h: h * k };
   }
 
   function isVisible(el) {
@@ -166,12 +251,16 @@
   function ensureVisible(el) {
     var r = el.getBoundingClientRect();
     var vp = viewport();
-    var margin = Math.min(120, vp.h * 0.12);
-    if (r.top < margin) window.scrollBy(0, r.top - vp.h * 0.3);
-    else if (r.bottom > vp.h - margin) window.scrollBy(0, Math.min(r.top - vp.h * 0.3, r.bottom - vp.h * 0.7));
-    if (r.left < 0 || r.right > vp.w) {
-      if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(false);
+    var margin = vp.h * 0.12;
+    var outside = r.top < margin || r.bottom > vp.h - margin || r.left < 0 || r.right > vp.w;
+    if (!outside) return;
+    // Let the browser do the maths: it knows how the zoom affects scrolling.
+    if (el.scrollIntoViewIfNeeded) {
+      el.scrollIntoViewIfNeeded(true);
+      r = el.getBoundingClientRect();
+      if (r.top >= margin && r.bottom <= vp.h - margin) return;
     }
+    try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { el.scrollIntoView(false); }
   }
 
   function candidates() {
@@ -251,6 +340,17 @@
       if (first) setCurrent(first);
       else scrollFor(dir);
       return;
+    }
+    // After scrolling through empty space the selection may be off-screen:
+    // continue from what is visible instead.
+    var cr = current.getBoundingClientRect();
+    var vp = viewport();
+    if (cr.bottom < 0 || cr.top > vp.h) {
+      var visible = firstInViewport();
+      if (visible) {
+        setCurrent(visible);
+        return;
+      }
     }
     var next = findNext(current, dir);
     if (next) {
@@ -405,6 +505,12 @@
         if (!isTop) return post(window.top, { type: 'key', code: code });
         e.preventDefault();
         location.reload();
+        return;
+
+      case KEY.BLUE:
+        if (!isTop) return post(window.top, { type: 'key', code: code });
+        e.preventDefault();
+        cycleZoom();
         return;
 
       case KEY.YELLOW:

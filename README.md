@@ -27,6 +27,9 @@ L'indirizzo viene ricordato: dagli avvii successivi il sito si apre da solo dopo
 | Rosso | Menu TizenSC (cambia indirizzo) |
 | Verde | Ricarica la pagina |
 | Giallo | Torna in cima alla pagina |
+| Blu | Cambia lo zoom: 100% → 125% → 150% → 175% → 200% (predefinito 150%, viene ricordato) |
+
+Le pagine del sito sono ingrandite (zoom 150%) per essere leggibili dal divano; a schermo intero lo zoom si disattiva.
 
 Pop-up e link "nuova finestra" vengono aperti nella stessa finestra (o bloccati), perché sulla TV non esistono schede.
 

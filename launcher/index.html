@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TizenSC</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f1115; color: #f2f2f2; font-family: "Samsung One", "Helvetica Neue", Arial, sans-serif; }
+  body { display: flex; align-items: center; justify-content: center; }
+  .box { width: 60%; max-width: 1100px; }
+  h1 { font-size: 64px; margin: 0 0 8px; letter-spacing: 1px; }
+  h1 span { color: #e50914; }
+  p { font-size: 28px; color: #b8bcc6; margin: 8px 0; }
+  .hidden { display: none !important; }
+  .url { color: #fff; font-weight: bold; word-break: break-all; }
+  .countdown { font-size: 120px; font-weight: bold; color: #e50914; margin: 24px 0; }
+  label { display: block; font-size: 26px; color: #b8bcc6; margin: 24px 0 8px; }
+  input { width: 100%; box-sizing: border-box; font-size: 34px; padding: 16px 20px; border-radius: 10px; border: 3px solid #333844; background: #1b1e25; color: #fff; outline: none; }
+  .buttons { margin-top: 24px; }
+  button { display: block; width: 100%; box-sizing: border-box; margin: 12px 0; font-size: 30px; padding: 18px 20px; text-align: left; border-radius: 10px; border: 3px solid #333844; background: #1b1e25; color: #f2f2f2; outline: none; }
+  .focusable:focus, .focused { border-color: #e50914 !important; background: #2a1517; box-shadow: 0 0 0 4px rgba(229, 9, 20, .35); }
+  .recent-title { margin-top: 28px; }
+  .hint { font-size: 22px; color: #7d8290; margin-top: 28px; }
+  .msg { font-size: 24px; color: #ffb4b4; min-height: 30px; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>Tizen<span>SC</span></h1>
+
+  <div id="splash" class="hidden">
+    <p>Apertura di</p>
+    <p class="url" id="splashUrl"></p>
+    <div class="countdown" id="countdown">3</div>
+    <p>Premi <b>OK</b> per aprire subito, qualsiasi altro tasto per le impostazioni.</p>
+  </div>
+
+  <div id="menu" class="hidden">
+    <p id="menuIntro">Inserisci l'indirizzo del sito da aprire.</p>
+    <label for="urlInput">Indirizzo (es. https://esempio.com)</label>
+    <input id="urlInput" class="focusable" type="url" autocomplete="off" spellcheck="false">
+    <div class="msg" id="msg"></div>
+    <div class="buttons">
+      <button class="focusable" id="btnOpen">&#9654;&nbsp; Salva e apri</button>
+      <button class="focusable" id="btnDefault">&#8634;&nbsp; Usa l'indirizzo predefinito (config.json)</button>
+      <button class="focusable" id="btnExit">&#10005;&nbsp; Esci</button>
+    </div>
+    <p class="recent-title hidden" id="recentTitle">Indirizzi recenti</p>
+    <div id="recent"></div>
+    <p class="hint">Sul sito: <b>Indietro</b> = pagina precedente &middot; tasto <b>Rosso</b> = questo menu &middot; tasto <b>Verde</b> = ricarica</p>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var STORAGE_URL = 'tizensc.url';
+  var STORAGE_RECENT = 'tizensc.recent';
+  var SESSION_LAUNCHED = 'tizensc.launched';
+  var KEY = { LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40, ENTER: 13, BACK: 10009, ESC: 27, IME_DONE: 65376, IME_CANCEL: 65385 };
+
+  var defaultUrl = '';
+  var countdownTimer = null;
+  var mode = '';
+
+  function $(id) { return document.getElementById(id); }
+
+  function store(key, value) {
+    try {
+      if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value);
+    } catch (e) {}
+  }
+  function load(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function sessionGet(key) {
+    try { return sessionStorage.getItem(key); } catch (e) { return null; }
+  }
+  function sessionSet(key, value) {
+    try { sessionStorage.setItem(key, value); } catch (e) {}
+  }
+
+  function normalize(url) {
+    url = (url || '').replace(/^\s+|\s+$/g, '');
+    if (!url) return '';
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    return url;
+  }
+
+  function getRecent() {
+    try { return JSON.parse(load(STORAGE_RECENT) || '[]'); } catch (e) { return []; }
+  }
+  function addRecent(url) {
+    var list = getRecent().filter(function (u) { return u !== url; });
+    list.unshift(url);
+    store(STORAGE_RECENT, JSON.stringify(list.slice(0, 5)));
+  }
+
+  function currentUrl() {
+    return normalize(load(STORAGE_URL) || defaultUrl);
+  }
+
+  function exitApp() {
+    try { tizen.application.getCurrentApplication().exit(); } catch (e) { window.close(); }
+  }
+
+  function go(url) {
+    url = normalize(url);
+    if (!url) {
+      showMenu('Inserisci un indirizzo valido.');
+      return;
+    }
+    store(STORAGE_URL, url);
+    addRecent(url);
+    sessionSet(SESSION_LAUNCHED, '1');
+    stopCountdown();
+    location.href = url;
+  }
+
+  function stopCountdown() {
+    if (countdownTimer) {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    }
+  }
+
+  function showSplash(url) {
+    mode = 'splash';
+    $('menu').className = 'hidden';
+    $('splash').className = '';
+    $('splashUrl').textContent = url;
+    var left = 3;
+    $('countdown').textContent = left;
+    stopCountdown();
+    countdownTimer = setInterval(function () {
+      left--;
+      $('countdown').textContent = left;
+      if (left <= 0) go(url);
+    }, 1000);
+  }
+
+  function showMenu(message) {
+    mode = 'menu';
+    stopCountdown();
+    $('splash').className = 'hidden';
+    $('menu').className = '';
+    $('msg').textContent = message || '';
+    var url = currentUrl();
+    $('urlInput').value = url || 'https://';
+    $('menuIntro').textContent = url
+      ? 'Modifica l\'indirizzo oppure premi "Salva e apri".'
+      : 'Inserisci l\'indirizzo del sito da aprire.';
+    $('btnDefault').className = defaultUrl ? 'focusable' : 'hidden';
+    renderRecent();
+    focusEl(url ? $('btnOpen') : $('urlInput'));
+  }
+
+  function renderRecent() {
+    var container = $('recent');
+    container.innerHTML = '';
+    var list = getRecent();
+    $('recentTitle').className = list.length ? 'recent-title' : 'hidden';
+    list.forEach(function (u) {
+      var b = document.createElement('button');
+      b.className = 'focusable';
+      b.textContent = u;
+      b.addEventListener('click', function () { go(u); });
+      container.appendChild(b);
+    });
+  }
+
+  function focusables() {
+    var all = document.querySelectorAll('#menu .focusable');
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].offsetParent !== null) out.push(all[i]);
+    }
+    return out;
+  }
+
+  function focusEl(el) {
+    if (!el) return;
+    el.focus();
+    if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(); else el.scrollIntoView(false);
+  }
+
+  function moveFocus(delta) {
+    var list = focusables();
+    var idx = list.indexOf(document.activeElement);
+    var next = idx === -1 ? 0 : Math.max(0, Math.min(list.length - 1, idx + delta));
+    focusEl(list[next]);
+  }
+
+  document.addEventListener('keydown', function (e) {
+    var code = e.keyCode;
+    if (mode === 'splash') {
+      e.preventDefault();
+      if (code === KEY.ENTER) go(currentUrl());
+      else if (code === KEY.BACK || code === KEY.ESC) exitApp();
+      else showMenu();
+      return;
+    }
+
+    var active = document.activeElement;
+    var inInput = active && active.tagName === 'INPUT';
+
+    switch (code) {
+      case KEY.UP:
+        e.preventDefault();
+        moveFocus(-1);
+        break;
+      case KEY.DOWN:
+        e.preventDefault();
+        moveFocus(1);
+        break;
+      case KEY.IME_DONE:
+      case KEY.IME_CANCEL:
+        if (inInput) {
+          active.blur();
+          focusEl($('btnOpen'));
+        }
+        break;
+      case KEY.ENTER:
+        // On an input, OK opens the TV's on-screen keyboard: leave it alone.
+        if (!inInput && active && active.click) {
+          e.preventDefault();
+          active.click();
+        }
+        break;
+      case KEY.BACK:
+      case KEY.ESC:
+        e.preventDefault();
+        if (inInput) moveFocus(1); else exitApp();
+        break;
+    }
+  });
+
+  $('btnOpen').addEventListener('click', function () { go($('urlInput').value); });
+  $('btnDefault').addEventListener('click', function () {
+    store(STORAGE_URL, null);
+    go(defaultUrl);
+  });
+  $('btnExit').addEventListener('click', exitApp);
+
+  // Coming back to this page (Back from the site's first page, the Red key or
+  // bfcache restore) must show the menu instead of bouncing straight back.
+  window.addEventListener('pageshow', function (e) {
+    if (e.persisted) showMenu();
+  });
+
+  function start() {
+    var wantsMenu = /[?&]menu=1/.test(location.search) || sessionGet(SESSION_LAUNCHED) === '1';
+    var url = currentUrl();
+    if (url && !wantsMenu) showSplash(url); else showMenu();
+  }
+
+  var done = false;
+  function onConfig(text) {
+    if (done) return;
+    done = true;
+    try { defaultUrl = normalize(JSON.parse(text).url); } catch (e) {}
+    start();
+  }
+
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '../config.json', true);
+    xhr.timeout = 4000;
+    xhr.onload = function () { onConfig(xhr.status === 200 ? xhr.responseText : ''); };
+    xhr.onerror = xhr.ontimeout = function () { onConfig(''); };
+    xhr.send();
+  } catch (e) {
+    onConfig('');
+  }
+  setTimeout(function () { onConfig(''); }, 5000);
+})();
+</script>
+</body>
+</html>

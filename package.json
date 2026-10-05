@@ -1,7 +1,7 @@
 {
   "name": "tizensc",
   "appName": "TizenSC",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Browser per TV Samsung (TizenBrew) che apre un sito a scelta con navigazione da telecomando.",
   "packageType": "mods",
   "websiteURL": "http://127.0.0.1:8081/module/gh%2Ffedeinfe%2FTizenSC/launcher/index.html",

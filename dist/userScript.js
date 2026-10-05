@@ -6,6 +6,8 @@
  * - Spatial navigation with the remote's arrow keys, OK = click
  * - Back = previous page / exit fullscreen / leave the player frame
  * - Media keys control the <video> (also inside the player iframe)
+ * - Player mode: left/right seek, OK pause, up/down reach the player's
+ *   buttons, with an on-screen bar showing time and progress
  * - Red = TizenSC menu, Green = reload, Yellow = back to top
  * - Page zoom for viewing from the sofa, Blue = change zoom level
  * - Ad block: pop-ups, pop-unders, redirects to ad sites, ad scripts/frames,
@@ -459,22 +461,34 @@
     return (!bg || bg === 'transparent' || /rgba\(.*,\s*0\)$/.test(bg)) && cs.backgroundImage === 'none';
   }
 
+  var PLAYER_NAME = /player|video|jw|vjs|plyr|media|stream/i;
+
+  // Things an ad layer never contains: the player (or the frame holding it).
+  function hasPlayerContent(el) {
+    if (el.querySelector('video,audio,canvas,embed,object')) return true;
+    var frames = el.tagName === 'IFRAME' ? [el] : el.getElementsByTagName('iframe');
+    for (var i = 0; i < frames.length; i++) {
+      if (!isAdUrl(frames[i].src)) return true;
+    }
+    return false;
+  }
+
   // Full-screen layers added on top of the page by ad scripts: invisible
   // click-catchers, or layers whose only content is a link to another site.
+  // A player container is empty and transparent too until the player starts,
+  // so names that look like a player are left alone (and see restoreOverlays).
   function isOverlay(el) {
     if (!el || el.nodeType !== 1 || /^tsc-/.test(el.id || '')) return false;
-    if (/^(SCRIPT|STYLE|LINK|META|VIDEO|HEAD|BODY)$/.test(el.tagName)) return false;
+    if (/^(SCRIPT|STYLE|LINK|META|VIDEO|AUDIO|CANVAS|HEAD|BODY)$/.test(el.tagName)) return false;
+    if (PLAYER_NAME.test(el.id || '') || PLAYER_NAME.test(typeof el.className === 'string' ? el.className : '')) return false;
     var cs = window.getComputedStyle(el);
     if (cs.display === 'none' || (cs.position !== 'fixed' && cs.position !== 'absolute')) return false;
     if (!(parseInt(cs.zIndex, 10) >= 1000)) return false;
     var r = el.getBoundingClientRect();
     var vp = viewport();
     if (r.width * r.height < vp.w * vp.h * 0.5) return false;
-    if (el.querySelector('video')) return false;
-    var frames = el.tagName === 'IFRAME' ? [el] : el.getElementsByTagName('iframe');
-    for (var i = 0; i < frames.length; i++) {
-      if (!isAdUrl(frames[i].src)) return false;
-    }
+    if (hasPlayerContent(el)) return false;
+    if (el.getElementsByTagName('*').length > 5) return false;
     var text = (el.innerText || '').replace(/\s+/g, '');
     if (!text && (parseFloat(cs.opacity) < 0.2 || isTransparent(cs))) return true;
     var link = el.tagName === 'A' ? el : null;
@@ -485,18 +499,31 @@
     return !!link && !isTrusted(hostOf(link.href));
   }
 
-  function hideAd(el) {
-    el.setAttribute('data-tsc-ad', '');
+  function hideAd(el, overlay) {
+    el.setAttribute('data-tsc-ad', overlay ? 'overlay' : '');
     el.style.setProperty('display', 'none', 'important');
     if (current && el.contains(current)) setCurrent(null);
   }
 
+  // A layer we hid that later fills up with a player was not an ad: show it again.
+  function restoreOverlays() {
+    var hidden = document.querySelectorAll('[data-tsc-ad="overlay"]');
+    for (var i = 0; i < hidden.length; i++) {
+      var el = hidden[i];
+      if (hasPlayerContent(el) || el.getElementsByTagName('*').length > 5) {
+        el.removeAttribute('data-tsc-ad');
+        el.style.removeProperty('display');
+      }
+    }
+  }
+
   function sweep() {
+    restoreOverlays();
     var roots = [document.documentElement, document.body];
     for (var i = 0; i < roots.length; i++) {
       var kids = roots[i] ? roots[i].children : [];
       for (var j = 0; j < kids.length; j++) {
-        if (!kids[j].hasAttribute('data-tsc-ad') && isOverlay(kids[j])) hideAd(kids[j]);
+        if (!kids[j].hasAttribute('data-tsc-ad') && isOverlay(kids[j])) hideAd(kids[j], true);
       }
     }
     var ads = document.querySelectorAll('iframe,embed,object');
@@ -853,10 +880,10 @@
     switch (code) {
       case KEY.PLAY_PAUSE:
       case KEY.ENTER:
-        if (video.paused) video.play(); else video.pause();
+        if (video.paused) play(video); else video.pause();
         break;
       case KEY.PLAY:
-        video.play();
+        play(video);
         break;
       case KEY.PAUSE:
         video.pause();
@@ -867,13 +894,129 @@
         break;
       case KEY.FF:
       case KEY.RIGHT:
-        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + SEEK_SECONDS);
-        break;
+        seek(video, 1);
+        return;
       case KEY.RW:
       case KEY.LEFT:
-        video.currentTime = Math.max(0, video.currentTime - SEEK_SECONDS);
-        break;
+        seek(video, -1);
+        return;
     }
+    showOsd(video);
+  }
+
+  function play(video) {
+    try {
+      var p = video.play();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
+
+  // Holding the key scrubs faster; the jump happens when the key is released
+  // for a moment, so the stream is not asked to seek at every step.
+  var seekTarget = null;
+  var seekTimer = null;
+  var seekStreak = 0;
+  var seekLast = 0;
+  function seek(video, dir) {
+    var now = Date.now();
+    seekStreak = now - seekLast < 700 ? seekStreak + 1 : 0;
+    seekLast = now;
+    var step = seekStreak >= 12 ? 60 : seekStreak >= 4 ? 30 : SEEK_SECONDS;
+    var base = seekTarget === null ? video.currentTime : seekTarget;
+    var max = isFinite(video.duration) ? Math.max(0, video.duration - 1) : Infinity;
+    seekTarget = Math.max(0, Math.min(max, base + dir * step));
+    clearTimeout(seekTimer);
+    seekTimer = setTimeout(function () {
+      try { video.currentTime = seekTarget; } catch (e) {}
+      seekTarget = null;
+      updateOsd(video);
+    }, 600);
+    showOsd(video);
+  }
+
+  /* ---------- on-screen player bar ---------- */
+
+  var osdHideTimer = null;
+  var osdTick = null;
+
+  function fmtTime(t) {
+    if (!isFinite(t) || t < 0) t = 0;
+    t = Math.floor(t);
+    var h = Math.floor(t / 3600);
+    var m = Math.floor(t % 3600 / 60);
+    var sec = t % 60;
+    return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+
+  function osdElement() {
+    var el = document.getElementById('tsc-osd');
+    if (el) return el;
+    el = document.createElement('div');
+    el.id = 'tsc-osd';
+    el.style.cssText = 'position:fixed;left:5%;right:5%;bottom:6%;z-index:2147483647;display:none;' +
+      'box-sizing:border-box;padding:18px 28px;background:rgba(0,0,0,.82);color:#fff;' +
+      'font:bold 30px Arial,sans-serif;border-radius:12px;border:3px solid #e50914;pointer-events:none;';
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;';
+    var state = document.createElement('span');
+    state.id = 'tsc-osd-state';
+    var time = document.createElement('span');
+    time.id = 'tsc-osd-time';
+    time.style.cssText = 'margin-left:auto;';
+    row.appendChild(state);
+    row.appendChild(time);
+    var track = document.createElement('div');
+    track.style.cssText = 'height:10px;margin-top:14px;background:rgba(255,255,255,.3);border-radius:5px;overflow:hidden;';
+    var bar = document.createElement('div');
+    bar.id = 'tsc-osd-bar';
+    bar.style.cssText = 'height:100%;width:0;background:#e50914;';
+    track.appendChild(bar);
+    var hint = document.createElement('div');
+    hint.style.cssText = 'margin-top:12px;font:20px Arial,sans-serif;color:#bbb;';
+    hint.textContent = '\u25C0 \u25B6 indietro/avanti \u00B7 OK pausa \u00B7 \u25B2 \u25BC comandi del player \u00B7 Indietro esci';
+    el.appendChild(row);
+    el.appendChild(track);
+    el.appendChild(hint);
+    return el;
+  }
+
+  function updateOsd(video) {
+    var el = document.getElementById('tsc-osd');
+    if (!el || el.style.display === 'none') return;
+    var t = seekTarget === null ? video.currentTime : seekTarget;
+    var d = video.duration;
+    var label = video.paused ? '\u275A\u275A  Pausa' : '\u25B6  In riproduzione';
+    if (seekTarget !== null) label = (seekTarget >= video.currentTime ? '\u25B6\u25B6  ' : '\u25C0\u25C0  ') + fmtTime(seekTarget);
+    document.getElementById('tsc-osd-state').textContent = label;
+    document.getElementById('tsc-osd-time').textContent = fmtTime(t) + (isFinite(d) ? ' / ' + fmtTime(d) : '');
+    document.getElementById('tsc-osd-bar').style.width = (isFinite(d) && d > 0 ? Math.min(100, t / d * 100) : 0) + '%';
+  }
+
+  function hideOsd() {
+    var el = document.getElementById('tsc-osd');
+    if (el) el.style.display = 'none';
+    clearInterval(osdTick);
+    osdTick = null;
+  }
+
+  // Stays up while paused or scrubbing, otherwise disappears after a few seconds.
+  function showOsd(video) {
+    if (!video) return;
+    var el = osdElement();
+    var fs = fullscreenElement();
+    // Outside the fullscreen element nothing is drawn.
+    var parent = fs && fs.tagName !== 'VIDEO' ? fs : document.body || document.documentElement;
+    if (el.parentNode !== parent) parent.appendChild(el);
+    el.style.display = 'block';
+    updateOsd(video);
+    if (!osdTick) osdTick = setInterval(function () { updateOsd(video); }, 500);
+    clearTimeout(osdHideTimer);
+    var arm = function () {
+      osdHideTimer = setTimeout(function () {
+        if (video.paused || seekTarget !== null) arm(); else hideOsd();
+      }, 4000);
+    };
+    arm();
   }
 
   function isMediaKey(code) {
@@ -885,6 +1028,78 @@
     var fs = fullscreenElement();
     if (!fs) return false;
     return fs.tagName === 'VIDEO' || !!fs.querySelector('video');
+  }
+
+  // The video that is the point of this page (or player frame).
+  function mainVideo() {
+    var v = findVideo();
+    if (!v) return null;
+    if (videoIsFullscreen()) return v;
+    var r = v.getBoundingClientRect();
+    var vp = viewport();
+    return r.width * r.height >= vp.w * vp.h * 0.3 ? v : null;
+  }
+
+  // A player button selected with up/down: arrows move between buttons again.
+  function inPlayerControls() {
+    return !!current && current.tagName !== 'VIDEO' && document.documentElement.contains(current) && isVisible(current);
+  }
+
+  function bigFrame() {
+    var frames = document.getElementsByTagName('iframe');
+    var vp = viewport();
+    for (var i = 0; i < frames.length; i++) {
+      var r = frames[i].getBoundingClientRect();
+      if (isVisible(frames[i]) && !isAdUrl(frames[i].src) && r.width * r.height >= vp.w * vp.h * 0.5) return frames[i];
+    }
+    return null;
+  }
+
+  function enterFrame(frame) {
+    frame.classList.remove(FOCUS_CLASS);
+    try { frame.focus(); frame.contentWindow.focus(); } catch (err) {}
+    post(frame.contentWindow, { type: 'enter-frame' });
+  }
+
+  // The player's buttons are drawn over the video: down picks the bottom bar
+  // (from the left), up the buttons at the top.
+  function controlOver(video, dir) {
+    if (dir !== 'up' && dir !== 'down') return null;
+    var vr = video.getBoundingClientRect();
+    var list = candidates();
+    var best = null;
+    var bestScore = Infinity;
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i];
+      if (el === video || el.contains(video) || el.tagName === 'IFRAME') continue;
+      var r = el.getBoundingClientRect();
+      var cx = r.left + r.width / 2;
+      var cy = r.top + r.height / 2;
+      if (cx < vr.left || cx > vr.right || cy < vr.top || cy > vr.bottom) continue;
+      var score = (dir === 'down' ? vr.bottom - r.bottom : r.top - vr.top) * 3 + (r.left - vr.left);
+      if (score < bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+    return best;
+  }
+
+  // Player mode: left/right seek, OK play/pause, up/down reach the player's own buttons.
+  function handlePlayerKey(code, video) {
+    if (code === KEY.LEFT || code === KEY.RIGHT || code === KEY.ENTER) {
+      handleMedia(code);
+      return;
+    }
+    var next = controlOver(video, DIRS[code]) || findNext(video, DIRS[code]);
+    if (next && next !== video) {
+      setCurrent(next);
+      showOsd(video);
+    } else if (!isTop) {
+      leaveFrame(DIRS[code]);
+    } else {
+      scrollFor(DIRS[code]);
+    }
   }
 
   /* ---------- keys ---------- */
@@ -900,11 +1115,11 @@
       return;
     }
 
-    // Fullscreen player: left/right seek, OK play/pause, up/down reach the controls.
-    if (videoIsFullscreen() && (code === KEY.LEFT || code === KEY.RIGHT || code === KEY.ENTER)) {
+    var video = (DIRS[code] || code === KEY.ENTER) && !typing && !inPlayerControls() ? mainVideo() : null;
+    if (video) {
       e.preventDefault();
       e.stopPropagation();
-      handleMedia(code);
+      handlePlayerKey(code, video);
       return;
     }
 
@@ -922,20 +1137,25 @@
       case KEY.ENTER: {
         var target = current && document.documentElement.contains(current) ? current : null;
         if (!target || typing || isTextField(target)) {
-          if (!target && !typing && findVideo()) {
-            e.preventDefault();
-            handleMedia(KEY.ENTER);
+          if (!target && !typing) {
+            // Nothing selected on a page that is just the player: go into it.
+            var frame = bigFrame();
+            if (frame) {
+              e.preventDefault();
+              enterFrame(frame);
+            } else if (findVideo()) {
+              e.preventDefault();
+              handleMedia(KEY.ENTER);
+            }
           }
           return;
         }
         e.preventDefault();
         e.stopPropagation();
         if (target.tagName === 'IFRAME') {
-          target.classList.remove(FOCUS_CLASS);
-          try { target.focus(); target.contentWindow.focus(); } catch (err) {}
-          post(target.contentWindow, { type: 'enter-frame' });
+          enterFrame(target);
         } else if (target.tagName === 'VIDEO') {
-          if (target.paused) target.play(); else target.pause();
+          handleMedia(KEY.ENTER);
         } else {
           noteIntent(target);
           userClickTarget = target;
@@ -948,7 +1168,13 @@
       case KEY.ESC:
         e.preventDefault();
         e.stopPropagation();
-        if (fullscreenElement()) {
+        if (inPlayerControls() && mainVideo()) {
+          // Back from the player's buttons to the video.
+          var v = mainVideo();
+          setCurrent(null);
+          if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+          showOsd(v);
+        } else if (fullscreenElement()) {
           exitFullscreen();
         } else if (typing && active.blur) {
           active.blur();
@@ -1002,7 +1228,15 @@
       handleMedia(msg.code);
     } else if (msg.type === 'enter-frame') {
       window.focus();
-      if (current && document.documentElement.contains(current)) {
+      var video = mainVideo();
+      var inner = video ? null : bigFrame();
+      if (video) {
+        setCurrent(null);
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+        showOsd(video);
+      } else if (inner) {
+        enterFrame(inner);
+      } else if (current && document.documentElement.contains(current)) {
         setCurrent(current);
       } else {
         var first = firstInViewport();
